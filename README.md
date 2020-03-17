@@ -1,6 +1,9 @@
 # Fcos_seg
 
 
+Fcos: https://arxiv.org/abs/1904.01355
+
+
 Fcos is an interesting object detection work.
 It removes the anchor and the tricks for training are good for multiscale.
 
