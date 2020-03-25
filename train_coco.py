@@ -9,14 +9,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, sampler
 from torch.utils.tensorboard import SummaryWriter
 
-from Fcos.core.config import get_cfg_defaults
-from Fcos.core.coco_eval import coco_evaluate
-from Fcos.data.coco_dataset import COCODataset
-from Fcos.data.transform import get_transform
-from Fcos.detector.fcos import FCOS
-from Fcos.utils.dist_helper import get_rank, synchronize, reduce_loss_dict, all_gather
-from Fcos.utils.sampler_helper import get_sampler, make_batch_data_sampler
-from Fcos.utils.dataset_helper import collate_fn
+from Fcos_seg.core.config import get_cfg_defaults
+from Fcos_seg.core.coco_eval import coco_evaluate
+from Fcos_seg.data.coco_dataset import COCODataset
+from Fcos_seg.data.transform import get_transform
+from Fcos_seg.detector.fcos import FCOS
+from Fcos_seg.utils.dist_helper import get_rank, synchronize, reduce_loss_dict, all_gather
+from Fcos_seg.utils.sampler_helper import get_sampler, make_batch_data_sampler
+from Fcos_seg.utils.dataset_helper import collate_fn
 
 
 
@@ -56,7 +56,7 @@ def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
-def training(args, epoch, loader, model, optimizer, device, writer = None):
+def training(args, cfg, epoch, loader, model, optimizer, device, writer = None):
     
     model.train()
     if get_rank() == 0:    
@@ -68,11 +68,28 @@ def training(args, epoch, loader, model, optimizer, device, writer = None):
     iteration = 1
     
     
+    total_warm_iter = cfg.TRAIN.WARM_UP_EPOCH * len(pbar)
+    
     # does not need idx
-    for images, targets, _ in pbar:
+    for images, targets, _ in pbar:       
+        
+        # change lr for warmup
+        if epoch < cfg.TRAIN.WARM_UP_EPOCH:              
+            alpha = float(iteration) / total_warm_iter
+            warm_factor = cfg.TRAIN.WARM_UP_FACTOR * (1.0-alpha) + alpha
+            cur_lr = get_lr(optimizer) * warm_factor + 1e-5 #prevent 0
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = cur_lr
+        # if just over the warm epoch, resume the origin learning rate
+        elif epoch == cfg.TRAIN.WARM_UP_EPOCH:
+            # back to init LR
+            cur_lr = cfg.TRAIN.LR
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = cur_lr
+            
         images = images.to(device)
         targets = [target.to(device) for target in targets]
-        _, loss_dict = model(images.tensors, targets=targets)
+        _, loss_dict = model(images, targets=targets)
         
         # loss_cls = loss_dict['loss_cls'].mean()
         # loss_reg = loss_dict['loss_box'].mean()
@@ -80,17 +97,19 @@ def training(args, epoch, loader, model, optimizer, device, writer = None):
         
         # loss = loss_cls + loss_reg + loss_center
         
-        losses = sum(loss for loss in loss_dict.values())     
+        losses = sum(loss for loss in loss_dict.values())
         
         # for record
-        loss_reduced = reduce_loss_dict(loss_dict)
-        loss_cls = loss_reduced['loss_cls'].mean().item()
-        loss_reg = loss_reduced['loss_box'].mean().item()
-        loss_center = loss_dict['loss_center'].mean().item()
+        loss_dict_reduced = reduce_loss_dict(loss_dict)
+        losses_reduced = sum(loss for loss in loss_dict_reduced.values())        
+
+        loss_cls = loss_dict_reduced['loss_cls'].item()
+        loss_reg = loss_dict_reduced['loss_reg'].item()
+        loss_center = loss_dict_reduced['loss_centerness'].item()
         
         optimizer.zero_grad()
         losses.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 10)
+        # nn.utils.clip_grad_norm_(model.parameters(), 10)
         optimizer.step()
         
         if get_rank() == 0:
@@ -104,6 +123,8 @@ def training(args, epoch, loader, model, optimizer, device, writer = None):
                 writer.add_scalar("Loss/reg_loss", loss_reg, epoch * total_data_len +  iteration)
                 writer.add_scalar("Loss/center_loss", loss_center, epoch * total_data_len +  iteration)            
         iteration += 1
+        
+        # break
 
 
 
@@ -147,12 +168,13 @@ def validation(args, epoch, dataset, loader, model, device, writer = None):
     for images, targets, data_idx in pbar:
         images = images.to(device)
         targets = [target.to(device) for target in targets]
-        pred, _ = model(images.tensors, img_size = images.sizes)
+        pred, _ = model(images, targets = targets)
         
         pred = [p.to('cpu') for p in pred]
         pred_results.update({id: p for id, p in zip(data_idx, pred)})
         # break
     
+    synchronize()
     pred_results = accumulate_predictions(pred_results)
     
     if get_rank() != 0:
@@ -234,11 +256,17 @@ def main():
     # get model and trans to cuda
     device = "cuda"
     model = FCOS(cfg)
+    model = model.to(device)
+    
+    if cfg.TRAIN.WARM_UP_EPOCH > 0:
+        cfg.TRAIN.MILESTONES = [m + cfg.TRAIN.WARM_UP_EPOCH for m in cfg.TRAIN.MILESTONES]
+            
     
     optimizer = torch.optim.SGD(model.parameters(), lr = cfg.TRAIN.LR, weight_decay=0.0001, momentum = cfg.TRAIN.MOMENTUM)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=cfg.TRAIN.MILESTONES, gamma=0.1)
-    total_epoch = cfg.TRAIN.EPOCH  
+    # warm + total epoch
+    total_epoch =  cfg.TRAIN.WARM_UP_EPOCH + cfg.TRAIN.EPOCH  
     cur_epoch = 0
     
     # is resume
@@ -251,10 +279,6 @@ def main():
         scheduler.load_state_dict(checkpoint['scheduler'])
         model.load_state_dict(checkpoint['model'])
         del checkpoint
-
-    
-    model = model.to(device)
-    
 
     # writer
     writer = None
@@ -276,8 +300,11 @@ def main():
                                                     )
     
     
-    for epoch in range(cur_epoch, total_epoch):
-        training(args, epoch, train_loader, model, optimizer, device, writer)
+    for epoch in range(cur_epoch, total_epoch):      
+        
+            
+        
+        training(args, cfg, epoch, train_loader, model, optimizer, device, writer)
         
         if get_rank() == 0:
             torch.save(
