@@ -28,9 +28,9 @@ class FcosPost(torch.nn.Module):
                 
         box_cls = box_cls.view(N, C, H, W).permute(0, 2, 3, 1)
         box_cls = box_cls.reshape(N, -1, C).sigmoid()
-        box_reg = box_reg.view(N, C, H, 4).permute(0, 2, 3, 1)
+        box_reg = box_reg.view(N, 4, H, W).permute(0, 2, 3, 1)
         box_reg = box_reg.reshape(N, -1, 4)
-        box_center = box_center.view(N, C, H, W).permute(0, 2, 3, 1)
+        box_center = box_center.view(N, 1, H, W).permute(0, 2, 3, 1)
         box_center = box_center.reshape(N, -1).sigmoid()
         
         candidate_inds = box_cls > self.pre_nms_thresh
@@ -63,14 +63,14 @@ class FcosPost(torch.nn.Module):
                 per_box_cls, top_k_indices = \
                     per_box_cls.topk(per_pre_nms_top_n, sorted=False)
                 per_class = per_class[top_k_indices]
-                per_box_regression = per_box_regression[top_k_indices]
+                per_box_reg = per_box_reg[top_k_indices]
                 per_locations = per_locations[top_k_indices]
                 
             detections = torch.stack([
-                per_locations[:, 0] - per_box_regression[:, 0],
-                per_locations[:, 1] - per_box_regression[:, 1],
-                per_locations[:, 0] + per_box_regression[:, 2],
-                per_locations[:, 1] + per_box_regression[:, 3],
+                per_locations[:, 0] - per_box_reg[:, 0],
+                per_locations[:, 1] - per_box_reg[:, 1],
+                per_locations[:, 0] + per_box_reg[:, 2],
+                per_locations[:, 1] + per_box_reg[:, 3],
             ], dim=1)
             
             
@@ -126,15 +126,15 @@ class FcosPost(torch.nn.Module):
                 
                 # if has predictions
                 if n_keep > 0:
-                    results_perbatch.append([cid_per_class, score_per_class.unsqueeze(-1), boxes_per_class], dim = 1)                    
-                    
-            
+                    results_perbatch.append(torch.cat([cid_per_class, score_per_class.unsqueeze(-1), boxes_per_class], dim = 1))
+
             # detections remain after nms
             n_detection = len(results_perbatch)
             # cat detections to tensor
             if n_detection > 0:
                 results_perbatch = torch.cat(results_perbatch, dim = 0)
 
+            
             # if still more than post top n
             if n_detection > self.post_nms_top_n > 0:
                 scores = results_perbatch[:, 1]
@@ -157,5 +157,3 @@ class FcosPost(torch.nn.Module):
         
         
         return boxlists
-    
-    

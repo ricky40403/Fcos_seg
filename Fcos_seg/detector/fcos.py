@@ -9,6 +9,7 @@ from Fcos_seg.detector.fcos_post import FcosPost
 from Fcos_seg.loss.fcos_loss import FcosLoss
 from Fcos_seg.detector.scale import Scale
 
+from Fcos_seg.utils.dist_helper import get_rank
 
 class FCOSHead(torch.nn.Module):
     def __init__(self, cfg, in_channels, total_stage):
@@ -94,6 +95,7 @@ class FCOSHead(torch.nn.Module):
         bbox_reg = []
         centerness = []
         for l, feature in enumerate(x):
+                
             cls_tower = self.cls_tower(feature)
             box_tower = self.bbox_tower(feature)
 
@@ -104,6 +106,7 @@ class FCOSHead(torch.nn.Module):
                 centerness.append(self.centerness(cls_tower))
 
             bbox_pred = self.scales[l](self.bbox_pred(box_tower))
+            
             if self.norm_reg_targets:
                 bbox_pred = F.relu(bbox_pred)
                 if self.training:
@@ -112,6 +115,7 @@ class FCOSHead(torch.nn.Module):
                     bbox_reg.append(bbox_pred * self.fpn_strides[l])
             else:
                 bbox_reg.append(torch.exp(bbox_pred))
+                
         return logits, bbox_reg, centerness
 
 
@@ -148,37 +152,59 @@ class FCOS(torch.nn.Module):
         self.fpn_strides = [8, 16, 32, 64, 128]
         
     
-    def compute_locations(self, features, img_h, img_w):       
+    def compute_locations(self, features):
+        locations = []
+        for level, feature in enumerate(features):
+            h, w = feature.size()[-2:]
+            locations_per_level = self.compute_locations_per_level(
+                h, w, self.fpn_strides[level],
+                feature.device
+            )
+            locations.append(locations_per_level)
+        return locations
+
+    def compute_locations_per_level(self, h, w, stride, device):
+        shifts_x = torch.arange(
+            0, w * stride, step=stride,
+            dtype=torch.float32, device=device
+        )
+        shifts_y = torch.arange(
+            0, h * stride, step=stride,
+            dtype=torch.float32, device=device
+        )
+        shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
+        shift_x = shift_x.reshape(-1)
+        shift_y = shift_y.reshape(-1)
+        locations = torch.stack((shift_x, shift_y), dim=1) + stride // 2
+        return locations
+    
+    
+    def get_locations(self, images, targets):
+        in_h, in_w = images.tensors[0].size()[-2:]
+        backbone_features = self.backbone(images.tensors)        
+        features = self.fpn(backbone_features)
+        for l, f in enumerate(features):
+            print("Level {} : {}".format(l, f.size()))
+        locations = self.compute_locations(features)
         
-        locations = []        
-        for f in features:
-            h, w = f.size()[-2:]            
-            locations.append(self.compute_locations_per_level(img_h, img_w, h, w, f.device))
-            
         return locations
         
-    # compute location using feature size and image size
-    def compute_locations_per_level(self, img_h, img_w, f_h, f_w, device):
-        y = torch.linspace(0, img_h-1, f_h).to(device)
-        x = torch.linspace(0, img_w-1, f_w).to(device)
-        center_y, center_x = torch.meshgrid(y, x)
-        center_y = center_y.squeeze(0).contiguous()
-        center_x = center_x.squeeze(0).contiguous()        
-        return torch.stack((center_x.view(-1), center_y.view(-1)), dim = 1) # [h * w, (cx, cy)]
-    
+        
     
     def forward(self, images, targets=None):
         
         in_h, in_w = images.tensors[0].size()[-2:]
         backbone_features = self.backbone(images.tensors)        
-        features = self.fpn(backbone_features)
+        features = self.fpn(backbone_features)        
+        
         
         box_cls, box_regression, centerness = self.head(features)
         
-        locations = self.compute_locations(features, in_h, in_w)        
+        locations = self.compute_locations(features)
+        
         
         if self.training:
-            loss_box_cls, loss_box_reg, loss_centerness = self.loss(locations, box_cls, box_regression, centerness, targets)
+            loss_box_cls, loss_box_reg, loss_centerness = self.loss(locations, box_cls, box_regression, centerness, targets, images)
             
             losses = {
                 "loss_cls": loss_box_cls,

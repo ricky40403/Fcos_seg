@@ -10,8 +10,8 @@ from torch import nn
 import torch.distributed as dist
 from torch.nn import functional as F
 
-from Fcos_seg.layers import IOULoss
-from Fcos_seg.layers import SigmoidFocalLoss
+from Fcos_seg.loss.iou_loss import IOULoss
+from Fcos_seg.loss.sigmoid_focal_loss import SigmoidFocalLoss
 
 # from Fcos_seg.utils.boxlist_ops import boxlist_iou
 # from Fcos_seg.utils.boxlist_ops import cat_boxlist
@@ -51,7 +51,7 @@ class FcosLoss(object):
     def compute_target_per_level(self, location_per_level, targets, field_size_per_level):
         
         
-        xs, ys = location_per_level[:, 0], location_per_level[:, 1]
+        # xs, ys = location_per_level[:, 0], location_per_level[:, 1]
         
         paried_label = []
         paired_reg = []
@@ -64,20 +64,22 @@ class FcosLoss(object):
             # target_area = target_per_im.area()
             
             
-            l = xs[:, None] - target_boxes[:, 0][None]
-            t = ys[:, None] - target_boxes[:, 1][None]
-            r = target_boxes[:, 2][None] - xs[:, None]
-            b = target_boxes[:, 3][None] - ys[:, None]
+            l = location_per_level[:, None, 0] - target_boxes[:, 0][None]
+            t = location_per_level[:, None, 1] - target_boxes[:, 1][None]
+            r = target_boxes[:, 2][None] - location_per_level[:, None, 0]
+            b = target_boxes[:, 3][None] - location_per_level[:, None, 1]
             
             
-            lrtb_bbox = torch.stack([l, r, t, b], dim=2)
+            ltrb_bbox = torch.stack([l, t, r, b], dim=2)
+            
+            # print(lrtb_bbox.size())
             
             # Step1 filter out piexl not in box
             # todo sampling method, cur use all
-            is_in_boxes = lrtb_bbox.min(dim=2)[0] > 0
+            is_in_boxes = ltrb_bbox.min(dim=2)[0] > 0
         
             # Step2: Filter out area not in receptive fields
-            cared_in_level = lrtb_bbox.max(dim=2)[0]
+            cared_in_level = ltrb_bbox.max(dim=2)[0]
             cared_in_level = (cared_in_level >= field_size_per_level[0]) & (cared_in_level <= field_size_per_level[1])
             
             
@@ -91,7 +93,7 @@ class FcosLoss(object):
             locations_to_min_area, locations_to_gt_inds = area.min(dim=1)
                         
             # preserve the targets
-            reg_per_img = lrtb_bbox[range(len(location_per_level)), locations_to_gt_inds]            
+            reg_per_img = ltrb_bbox[range(len(location_per_level)), locations_to_gt_inds]            
             labels_per_im  = target_label[locations_to_gt_inds]
             labels_per_im [locations_to_min_area == self.inf] = 0            
             
@@ -121,8 +123,24 @@ class FcosLoss(object):
         centerness = (left_right.min(dim=-1)[0] / left_right.max(dim=-1)[0]) * \
                       (top_bottom.min(dim=-1)[0] / top_bottom.max(dim=-1)[0])
         return torch.sqrt(centerness)
+    
+    def test_target_samples(self, locations, targets, images):
+        
+        field_size = self.compute_receptive_fields()
+        
+        out_cls = []
+        out_reg = []
+        for l in range(len(locations)):
+            target_cls_per_level, target_reg_per_level = self.compute_target_per_level(locations[l], targets, field_size[l])            
+            target_cls_per_level = torch.cat(target_cls_per_level, dim = 0).reshape(-1)
+            target_reg_per_level = torch.cat(target_reg_per_level, dim = 0).reshape(-1, 4)
+            
+            out_cls.append(target_cls_per_level)
+            out_reg.append(target_reg_per_level)
+        return out_cls, out_reg, locations
+            
 
-    def __call__(self, locations, box_cls, box_regression, centerness, targets):
+    def __call__(self, locations, box_cls, box_regression, centerness, targets, images):
         
         
         num_classes = box_cls[0].size(1)
@@ -137,18 +155,26 @@ class FcosLoss(object):
         field_size = self.compute_receptive_fields()
         
         # loop level
-        for l in range(len(locations)):
-            pred_cls.append(box_cls[l].permute(0, 2, 3, 1).reshape(-1, num_classes)) # N x h x w, C
-            pred_reg.append(box_regression[l].permute(0, 2, 3, 1).reshape(-1, 4)) # N x h x w, 4
-            pred_center.append(centerness[l].permute(0, 2, 3, 1).reshape(-1)) # N x h x w
+        for l in range(len(locations)):            
+            pred_cls.append(box_cls[l].permute(0, 2, 3, 1).contiguous().reshape(-1, num_classes)) # N x h x w, C
+            pred_reg.append(box_regression[l].permute(0, 2, 3, 1).contiguous().reshape(-1, 4)) # N x h x w, 4
+            pred_center.append(centerness[l].permute(0, 2, 3, 1).contiguous().reshape(-1)) # N x h x w
             
             # tmp_field = torch.FloatTensor(field_size[l]).to(locations[l].device)
             # # return [N [h x w]], [N, [h x w, 4]]
             target_cls_per_level, target_reg_per_level = self.compute_target_per_level(locations[l], targets, field_size[l])
             
+            target_cls_per_level = torch.cat(target_cls_per_level, dim = 0).reshape(-1)
+            target_reg_per_level = torch.cat(target_reg_per_level, dim = 0).reshape(-1, 4)
+            
+            
+            if self.norm_reg_targets:
+                target_reg_per_level = target_reg_per_level / self.fpn_strides[l]
+            
+            
             # cat the batch and append to target list
-            target_cls.append(torch.cat(target_cls_per_level, dim = 0).reshape(-1)) # N x h x w
-            target_reg.append(torch.cat(target_reg_per_level, dim = 0).reshape(-1, 4)) # N x h x w, 4
+            target_cls.append(target_cls_per_level) # N x h x w
+            target_reg.append(target_reg_per_level) # N x h x w, 4
             
             
         # cat level by lebel

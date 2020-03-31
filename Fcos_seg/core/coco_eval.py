@@ -43,13 +43,13 @@ def evaluate_predictions_on_coco(coco_gt, results, result_file, iou_type):
 def make_coco_detection(predictions, dataset):
     coco_results = []
 
-    for id, pred in enumerate(predictions):
-        orig_id = dataset.id_to_img_map[id]
+    for image_id, pred in enumerate(predictions):
+        orig_id = dataset.id_to_img_map[image_id]
 
         if len(pred) == 0:
             continue
 
-        img_meta = dataset.get_image_meta(id)
+        img_meta = dataset.get_image_meta(image_id)
         width = img_meta['width']
         height = img_meta['height']
         pred = pred.resize((width, height))
