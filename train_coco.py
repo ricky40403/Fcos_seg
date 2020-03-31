@@ -74,14 +74,14 @@ def training(args, cfg, epoch, loader, model, optimizer, device, writer = None):
     for images, targets, _ in pbar:       
         
         # change lr for warmup
-        if epoch < cfg.TRAIN.WARM_UP_EPOCH:              
+        if epoch < cfg.TRAIN.WARM_UP_EPOCH and iteration<500:
             alpha = float(iteration) / total_warm_iter
             warm_factor = cfg.TRAIN.WARM_UP_FACTOR * (1.0-alpha) + alpha
             cur_lr = get_lr(optimizer) * warm_factor + 1e-5 #prevent 0
             for param_group in optimizer.param_groups:
                 param_group['lr'] = cur_lr
         # if just over the warm epoch, resume the origin learning rate
-        elif epoch == cfg.TRAIN.WARM_UP_EPOCH:
+        elif epoch < cfg.TRAIN.WARM_UP_EPOCH and iteration>=500:
             # back to init LR
             cur_lr = cfg.TRAIN.LR
             for param_group in optimizer.param_groups:
@@ -261,12 +261,13 @@ def main():
     if cfg.TRAIN.WARM_UP_EPOCH > 0:
         cfg.TRAIN.MILESTONES = [m + cfg.TRAIN.WARM_UP_EPOCH for m in cfg.TRAIN.MILESTONES]
             
+
     
     optimizer = torch.optim.SGD(model.parameters(), lr = cfg.TRAIN.LR, weight_decay=0.0001, momentum = cfg.TRAIN.MOMENTUM)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=cfg.TRAIN.MILESTONES, gamma=0.1)
     # warm + total epoch
-    total_epoch =  cfg.TRAIN.WARM_UP_EPOCH + cfg.TRAIN.EPOCH  
+    total_epoch =  cfg.TRAIN.EPOCH # + cfg.TRAIN.WARM_UP_EPOCH 
     cur_epoch = 0
     
     # is resume
